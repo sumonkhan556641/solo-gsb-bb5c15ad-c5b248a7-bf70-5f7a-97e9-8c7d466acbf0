@@ -1,0 +1,16 @@
+services:
+  uploader:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATA_DIR: /data
+      # How often the background task reaps upload sessions whose idle lease
+      # (idle_timeout_seconds at session creation) has elapsed.
+      REAPER_INTERVAL_SECONDS: "300"
+    volumes:
+      - upload-data:/data
+    restart: unless-stopped
+
+volumes:
+  upload-data:
