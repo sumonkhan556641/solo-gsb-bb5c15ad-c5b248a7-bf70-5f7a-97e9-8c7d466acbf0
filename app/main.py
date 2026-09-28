@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 from . import config, db, storage
@@ -96,6 +96,23 @@ class CreateSessionRequest(BaseModel):
                 raise ValueError("file_sha256 must be 64 hex characters")
             return value.lower()
         return None
+
+
+class CreateArchiveRequest(BaseModel):
+    session_ids: list[str] = Field(
+        min_length=1,
+        max_length=1000,
+        description="Ordered, non-repeating ids of completed sessions to export",
+    )
+
+    @field_validator("session_ids")
+    @classmethod
+    def _ordered_unique_nonempty(cls, value: list[str]) -> list[str]:
+        if any(not item.strip() for item in value):
+            raise ValueError("session_ids must not contain empty values")
+        if len(set(value)) != len(value):
+            raise ValueError("session_ids must not contain duplicates")
+        return value
 
 
 # ---------------------------------------------------------------- helpers
@@ -490,3 +507,68 @@ def abort_session(session_id: str):
             os.unlink(session["final_path"])
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------- archives
+
+
+@app.post("/archives", status_code=status.HTTP_201_CREATED)
+def create_archive(body: CreateArchiveRequest) -> dict:
+    """Export several completed uploads as one ZIP, in the requested order.
+
+    Every id must reference a completed session whose product still exists on
+    disk; all source files are opened and pinned before the archive is written
+    (bounded buffering), atomically published and recorded. Duplicate or empty
+    ids are rejected at validation (422); an unknown session gives 404 and any
+    non-completed / missing source gives 409, and in every error case no
+    archive file or record is left behind.
+    """
+    try:
+        return storage.create_archive(body.session_ids)
+    except storage.ArchiveSourceError as exc:
+        if exc.kind == "not_found":
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                detail={"message": "session not found", "session_id": exc.session_id},
+            )
+        if exc.kind == "not_completed":
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "session is not completed",
+                    "session_id": exc.session_id,
+                },
+            )
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "message": "completed file is missing on disk",
+                "session_id": exc.session_id,
+            },
+        )
+
+
+@app.get("/archives/{archive_id}/content")
+def download_archive(archive_id: str):
+    """Download a previously created ZIP archive."""
+    with db.connect() as conn:
+        archive = db.get_archive(conn, archive_id)
+    if archive is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "archive not found")
+    path = Path(archive["path"])
+    if not path.is_file():
+        # Record without bytes should never happen (publish precedes the row);
+        # answer honestly rather than streaming a 500 from FileResponse.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "archive file is missing on disk")
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=f"{archive_id}.zip",
+    )
+
+
+@app.delete("/archives/{archive_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_archive(archive_id: str):
+    """Delete an archive's ZIP and its record. Source sessions are untouched."""
+    if not storage.delete_archive(archive_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "archive not found")

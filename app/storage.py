@@ -9,13 +9,15 @@ import re
 import shutil
 import sqlite3
 import threading
+import uuid
+import zipfile
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config, db
 
-_COPY_BUFFER = 1024 * 1024  # 1 MiB streaming buffer for merge/verify
+_COPY_BUFFER = 1024 * 1024  # 1 MiB streaming buffer for merge/verify/archive IO
 
 log = logging.getLogger("chunked-upload")
 
@@ -111,6 +113,34 @@ def reconcile() -> None:
                         "DELETE FROM chunks WHERE session_id = ? AND chunk_index = ?",
                         (session["id"], row["chunk_index"]),
                     )
+    reconcile_archives()
+
+
+def reconcile_archives() -> None:
+    """Heal crashes around the temp-file -> publish -> record window.
+
+    Removes published archive files with no DB row, DB rows with no file, their
+    entry rows, and any leftover temp artifacts, so a failed process can never
+    leave a downloadable half-built ZIP behind.
+    """
+    files_dir = config.archives_dir()
+    with db.connect() as conn:
+        ids = {
+            row["id"] for row in conn.execute("SELECT id FROM archives").fetchall()
+        }
+        on_disk = (
+            {p.stem for p in files_dir.glob("*.zip")} if files_dir.is_dir() else set()
+        )
+
+        for archive_id in ids - on_disk:
+            conn.execute("DELETE FROM archives WHERE id = ?", (archive_id,))
+        for stale in on_disk - ids:
+            (files_dir / f"{stale}.zip").unlink(missing_ok=True)
+
+    # Temporary artifacts from an interrupted build (none have a DB record).
+    if files_dir.is_dir():
+        for tmp in files_dir.glob("*.zip.tmp-*"):
+            tmp.unlink(missing_ok=True)
 
 
 def expire_idle_sessions(now: datetime | None = None) -> list[str]:
@@ -264,3 +294,215 @@ def merge_session(session_id: str) -> dict:
     with db.connect() as conn:
         session = db.get_session(conn, session_id)
         return db.session_payload(conn, session)
+
+
+# ---------------------------------------------------------------- archives
+
+
+class ArchiveSourceError(Exception):
+    """A requested source session cannot feed an archive.
+
+    `kind` is "not_found" (unknown session id), "not_completed" (the session is
+    still uploading or expired) or "missing" (the merged product vanished or
+    changed); the offending session id is carried alongside.
+    """
+
+    def __init__(self, kind: str, session_id: str | None = None):
+        super().__init__(f"archive source is {kind}")
+        self.kind = kind
+        self.session_id = session_id
+
+
+def _zip_entry_name(filename: str) -> str:
+    """Reduce a client filename to a safe ZIP member name.
+
+    Only the final path component survives (entries never escape the archive
+    root) and the extension (last suffix) is preserved.
+    """
+    name = sanitize_filename(filename)
+    stem, dot, suffix = name.rpartition(".")
+    stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem if dot else suffix).strip("._")
+    stem = stem or "file"
+    return stem + ("." + suffix if dot and suffix else "")
+
+
+def unique_entry_names(sessions: list[sqlite3.Row]) -> list[str]:
+    """Assign stable, collision-free ZIP member names in request order.
+
+    The first occurrence keeps its name; later ones (compared
+    case-insensitively, so the ZIP stays safe on every extractor/OS) get a
+    `-<n>` suffix on the stem while the extension is retained.
+    """
+    used: set[str] = set()
+    names: list[str] = []
+    for session in sessions:
+        candidate = _zip_entry_name(session["filename"])
+        if candidate.lower() in used:
+            stem, dot, suffix = candidate.rpartition(".")
+            stem = stem if dot else suffix
+            suffix = ("." + suffix) if dot else ""
+            counter = 2
+            while True:
+                candidate = f"{stem}-{counter}{suffix}"
+                if candidate.lower() not in used:
+                    break
+                counter += 1
+        used.add(candidate.lower())
+        names.append(candidate)
+    return names
+
+
+def archive_path(archive_id: str) -> Path:
+    return config.archives_dir() / f"{archive_id}.zip"
+
+
+def create_archive(session_ids: list[str]) -> dict:
+    """Build a ZIP from completed sessions' products, in the given order.
+
+    Every source file is opened and validated *first*; only then is the
+    temporary archive written in bounded blocks, published atomically with
+    os.replace(), and finally recorded in the DB. Any failure before publish
+    removes the temp file, so a broken archive is never downloadable.
+    """
+    sources: list[sqlite3.Row] = []
+    with db.connect() as conn:
+        for sid in session_ids:
+            session = db.get_session(conn, sid)
+            if session is None:
+                raise ArchiveSourceError("not_found", sid)
+            if session["status"] != "completed" or not session["final_path"]:
+                raise ArchiveSourceError("not_completed", sid)
+            sources.append(session)
+        names = unique_entry_names(sources)
+
+    # Phase 1: open and pin every source file before touching the archive.
+    # A deletion racing us cannot remove an open file's bytes, and a vanished
+    # or truncated product fails the whole request before any ZIP is written.
+    members: list[dict] = []
+    handles: list = []
+    try:
+        for session, name in zip(sources, names):
+            try:
+                fh = open(session["final_path"], "rb")
+            except OSError:
+                raise ArchiveSourceError("missing", session["id"])
+            handles.append(fh)
+            size = fh.seek(0, os.SEEK_END)
+            if size != session["total_size"]:
+                # The product diverged from the metadata the session holds.
+                raise ArchiveSourceError("missing", session["id"])
+            fh.seek(0)
+            members.append(
+                {
+                    "session_id": session["id"],
+                    "entry_name": name,
+                    "file_size": size,
+                }
+            )
+
+        # Phase 2: stream the pinned handles into a temp archive in bounded
+        # blocks, publish it atomically, then record it. Nothing in this window
+        # is reachable through the download endpoint.
+        archive_id = uuid.uuid4().hex
+        config.archives_dir().mkdir(parents=True, exist_ok=True)
+        published = archive_path(archive_id)
+        tmp_path = published.with_name(
+            published.name + f".tmp-{uuid.uuid4().hex}"
+        )
+        try:
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_STORED) as archive:
+                for fh, member in zip(handles, members):
+                    info = zipfile.ZipInfo(
+                        filename=member["entry_name"],
+                        date_time=(1980, 1, 1, 0, 0, 0),
+                    )
+                    info.create_system = 3  # portable Unix-style entries
+                    info.external_attr = (0o644 & 0xFFFF) << 16
+                    info.compress_type = zipfile.ZIP_STORED
+                    info.file_size = member["file_size"]
+                    written = 0
+                    # ZIP64 is only needed for an entry at/above the 4 GiB limit.
+                    with archive.open(
+                        info,
+                        "w",
+                        force_zip64=member["file_size"] >= zipfile.ZIP64_LIMIT,
+                    ) as out:
+                        while True:
+                            block = fh.read(_COPY_BUFFER)
+                            if not block:
+                                break
+                            out.write(block)
+                            written += len(block)
+                    if written != member["file_size"]:
+                        raise OSError("source file changed while archiving")
+
+            os.replace(tmp_path, published)  # atomic publish
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+    finally:
+        for fh in handles:
+            fh.close()
+
+    moment = db.utcnow()
+    with db.connect() as conn:
+        try:
+            conn.execute(
+                "INSERT INTO archives (id, path, size, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (archive_id, str(published), published.stat().st_size, moment),
+            )
+            for position, member in enumerate(members):
+                conn.execute(
+                    "INSERT INTO archive_entries "
+                    "(archive_id, position, session_id, entry_name, file_size) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        archive_id,
+                        position,
+                        member["session_id"],
+                        member["entry_name"],
+                        member["file_size"],
+                    ),
+                )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            published.unlink(missing_ok=True)
+            raise
+
+    with db.connect() as conn:
+        return archive_payload(conn, db.get_archive(conn, archive_id))
+
+
+def archive_payload(conn: sqlite3.Connection, archive: sqlite3.Row) -> dict:
+    entries = db.get_archive_entries(conn, archive["id"])
+    return {
+        "archive_id": archive["id"],
+        "size": archive["size"],
+        "created_at": archive["created_at"],
+        "files": [
+            {
+                "position": row["position"],
+                "session_id": row["session_id"],
+                "entry_name": row["entry_name"],
+                "size": row["file_size"],
+            }
+            for row in entries
+        ],
+    }
+
+
+def delete_archive(archive_id: str) -> bool:
+    """Remove an archive's record and its ZIP. Returns False if unknown."""
+    with db.connect() as conn:
+        archive = db.get_archive(conn, archive_id)
+        if archive is None:
+            return False
+        path = Path(archive["path"])
+        conn.execute("DELETE FROM archives WHERE id = ?", (archive_id,))
+    # The record (and its entries, via FK cascade) is gone first: a concurrent
+    # download that already resolved the path may still finish, but nobody can
+    # start a new one against a deleted archive.
+    path.unlink(missing_ok=True)
+    return True

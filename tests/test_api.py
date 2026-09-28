@@ -6,9 +6,12 @@ Run with:  DATA_DIR=$(mktemp -d) pytest tests/
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import sqlite3
+import stat
 import tempfile
+import zipfile
 from datetime import datetime, timedelta, timezone
 
 # Point storage at a throwaway directory BEFORE importing the app.
@@ -16,6 +19,7 @@ _TMP = tempfile.mkdtemp(prefix="chunked-upload-test-")
 os.environ["DATA_DIR"] = _TMP
 
 from fastapi.testclient import TestClient  # noqa: E402
+import pytest  # noqa: E402
 
 from app import config, db, storage  # noqa: E402
 from app.main import app  # noqa: E402
@@ -45,6 +49,22 @@ def _create(client: TestClient, data: bytes, chunk_size: int, **extra) -> dict:
     )
     assert resp.status_code == 201, resp.text
     return resp.json()
+
+
+def _completed_named(client: TestClient, filename: str, data: bytes | None = None) -> dict:
+    """Upload + complete a tiny session with the given client filename."""
+    data = data if data is not None else os.urandom(2000)
+    session = _create(
+        client, data, 1024, filename=filename, file_sha256=_sha256(data)
+    )
+    sid = session["session_id"]
+    for index, offset in enumerate(range(0, len(data), 1024)):
+        assert (
+            _put(client, sid, index, data[offset : offset + 1024]).status_code == 200
+        )
+    done = client.post(f"/uploads/{sid}/complete")
+    assert done.status_code == 200, done.text
+    return {"session_id": sid, "data": data, **done.json()}
 
 
 def _put(client: TestClient, sid: str, index: int, payload: bytes, digest: str | None = None):
@@ -612,3 +632,324 @@ def test_init_db_migrates_pre_lease_database():
     finally:
         config.DB_PATH = original
 
+
+
+# ---------------------------------------------------------------- archives
+
+
+def _create_archive(client: TestClient, ids: list[str], expected: int = 201):
+    resp = client.post("/archives", json={"session_ids": ids})
+    assert resp.status_code == expected, resp.text
+    return resp
+
+
+def _no_archive_residue() -> None:
+    """A failed archive build must never leave a temp artifact behind."""
+    assert not list(config.archives_dir().glob("*.tmp-*"))
+
+
+def _archive_rows() -> set:
+    with db.connect() as conn:
+        return {
+            r[0] for r in conn.execute("SELECT id FROM archives").fetchall()
+        }
+
+
+def test_archive_basic_ordered_export_and_download():
+    with TestClient(app) as client:
+        a = _completed_named(client, "alpha.txt", b"AAA" * 100)
+        b = _completed_named(client, "beta.bin", os.urandom(3000))
+        c = _completed_named(client, "gamma.dat", b"CCC")
+
+        # Request order is honoured in the response and inside the ZIP.
+        body = _create_archive(client, [c["session_id"], a["session_id"], b["session_id"]]).json()
+        aid = body["archive_id"]
+        assert [f["entry_name"] for f in body["files"]] == [
+            "gamma.dat",
+            "alpha.txt",
+            "beta.bin",
+        ]
+        assert [f["position"] for f in body["files"]] == [0, 1, 2]
+        assert [f["session_id"] for f in body["files"]] == [
+            c["session_id"],
+            a["session_id"],
+            b["session_id"],
+        ]
+        assert sum(f["size"] for f in body["files"]) == len(c["data"]) + len(a["data"]) + len(b["data"])
+        assert body["size"] > 0
+        assert body["created_at"]
+
+        resp = client.get(f"/archives/{aid}/content")
+        assert resp.status_code == 200
+        assert resp.headers["content-type"] == "application/zip"
+        assert resp.headers["content-disposition"] == (
+            f'attachment; filename="{aid}.zip"'
+        )
+        assert int(resp.headers["content-length"]) == len(resp.content) == body["size"]
+
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            assert zf.testzip() is None
+            assert zf.namelist() == ["gamma.dat", "alpha.txt", "beta.bin"]
+            assert zf.read("gamma.dat") == c["data"]
+            assert zf.read("alpha.txt") == a["data"]
+            assert zf.read("beta.bin") == b["data"]
+            info = zf.getinfo("alpha.txt")
+            assert info.file_size == len(a["data"])
+            assert stat.S_IMODE(info.external_attr >> 16) == 0o644
+
+
+def test_archive_collision_names_are_stable_extensions_kept():
+    with TestClient(app) as client:
+        one = _completed_named(client, "report.pdf", b"1")
+        two = _completed_named(client, "report.pdf", b"22")
+        three = _completed_named(client, "REPORT.PDF", b"333")  # case clash
+        four = _completed_named(client, "report", b"4444")     # no extension
+        five = _completed_named(client, "report.pdf", b"55555")
+
+        body = _create_archive(
+            client,
+            [
+                one["session_id"],
+                two["session_id"],
+                three["session_id"],
+                four["session_id"],
+                five["session_id"],
+            ],
+        ).json()
+        names = [f["entry_name"] for f in body["files"]]
+        assert names == [
+            "report.pdf",
+            "report-2.pdf",
+            "REPORT-3.PDF",
+            "report",
+            "report-4.pdf",
+        ]
+
+        resp = client.get(f"/archives/{body['archive_id']}/content")
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            assert zf.namelist() == names
+            assert zf.read("report.pdf") == b"1"
+            assert zf.read("report-2.pdf") == b"22"
+            assert zf.read("REPORT-3.PDF") == b"333"
+            assert zf.read("report") == b"4444"
+            assert zf.read("report-4.pdf") == b"55555"
+
+        # Rebuilding the same set in a different order yields the same
+        # deterministic algorithm applied to that order.
+        again = _create_archive(
+            client, [three["session_id"], one["session_id"], two["session_id"]]
+        ).json()
+        assert [f["entry_name"] for f in again["files"]] == [
+            "REPORT.PDF",
+            "report-2.pdf",
+            "report-3.pdf",
+        ]
+
+
+def test_archive_request_validation():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.bin")["session_id"]
+
+        # Empty list, duplicates, blank ids are all 422.
+        for payload in (
+            {"session_ids": []},
+            {"session_ids": [a, a]},
+            {"session_ids": [a, "  "]},
+        ):
+            resp = client.post("/archives", json=payload)
+            assert resp.status_code == 422, payload
+
+
+def test_archive_sources_must_be_completed_and_existing():
+    with TestClient(app) as client:
+        data, chunks = _make_file(256, total_chunks=2, last_size=256)
+        before_files = set(os.listdir(config.archives_dir()))
+        before_rows = _archive_rows()
+
+        # Unknown id -> 404 naming the offender.
+        resp = _create_archive(client, ["does-not-exist"], expected=404)
+        assert resp.json()["detail"]["session_id"] == "does-not-exist"
+
+        # Uploading session -> 409.
+        sid = _create(client, data, 256)["session_id"]
+        resp = _create_archive(client, [sid], expected=409)
+        assert resp.json()["detail"]["session_id"] == sid
+
+        # Expired session -> 409 as well (not "completed").
+        esid = _create(client, data, 256, idle_timeout_seconds=1)["session_id"]
+        assert _put(client, esid, 0, chunks[0]).status_code == 200
+        _set_last_activity(esid, datetime.now(timezone.utc) - timedelta(hours=1))
+        assert storage.expire_idle_sessions() == [esid]
+        assert _create_archive(client, [esid], expected=409).status_code == 409
+
+        # A bad source anywhere in the list dooms the whole request; the good
+        # sessions before it produce nothing.
+        good = _completed_named(client, "good.bin")["session_id"]
+        assert _create_archive(client, [good, sid], expected=409).status_code == 409
+
+        # No new archive (and no temp file) may have been created.
+        _no_archive_residue()
+        assert set(os.listdir(config.archives_dir())) == before_files
+        assert _archive_rows() == before_rows
+
+
+def test_archive_vanished_source_file_is_rejected_and_leaves_nothing():
+    with TestClient(app) as client:
+        before_files = set(os.listdir(config.archives_dir()))
+        before_rows = _archive_rows()
+        one = _completed_named(client, "one.bin", b"1111")
+        two = _completed_named(client, "two.bin", b"2222")
+        os.unlink(one["final_path"])
+
+        # Row says completed but the product is gone -> 409, no artifacts.
+        resp = _create_archive(
+            client, [two["session_id"], one["session_id"]], expected=409
+        )
+        assert resp.json()["detail"]["session_id"] == one["session_id"]
+        _no_archive_residue()
+        assert set(os.listdir(config.archives_dir())) == before_files
+        assert _archive_rows() == before_rows
+
+
+def test_archive_delete_removes_file_and_record():
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.bin", b"aaaa")
+        body = _create_archive(client, [a["session_id"]]).json()
+        aid = body["archive_id"]
+        path = storage.archive_path(aid)
+        assert path.is_file()
+
+        # Unknown archive -> 404 on delete and content.
+        assert client.delete("/archives/nope").status_code == 404
+        assert client.get("/archives/nope/content").status_code == 404
+
+        assert client.delete(f"/archives/{aid}").status_code == 204
+        assert not path.exists()
+        assert client.get(f"/archives/{aid}/content").status_code == 404
+        # Delete is idempotent-404.
+        assert client.delete(f"/archives/{aid}").status_code == 404
+        with db.connect() as conn:
+            assert db.get_archive(conn, aid) is None
+            assert conn.execute(
+                "SELECT COUNT(*) FROM archive_entries WHERE archive_id = ?", (aid,)
+            ).fetchone()[0] == 0
+
+
+def test_archive_survives_source_session_deletion():
+    with TestClient(app) as client:
+        a = _completed_named(client, "keep.bin", b"payload-A")
+        b = _completed_named(client, "keep.bin", b"payload-BB")
+        body = _create_archive(client, [a["session_id"], b["session_id"]]).json()
+        aid = body["archive_id"]
+        assert [f["entry_name"] for f in body["files"]] == ["keep.bin", "keep-2.bin"]
+
+        # Deleting the originating sessions (and their product files) must not
+        # affect the already published archive or its record.
+        assert client.delete(f"/uploads/{a['session_id']}").status_code == 204
+        assert client.delete(f"/uploads/{b['session_id']}").status_code == 204
+        assert not os.path.exists(a["final_path"])
+
+        resp = client.get(f"/archives/{aid}/content")
+        assert resp.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            assert zf.read("keep.bin") == b"payload-A"
+            assert zf.read("keep-2.bin") == b"payload-BB"
+
+        # The entries still record the (now deleted) source session ids.
+        with db.connect() as conn:
+            payload = db.get_archive_entries(conn, aid)
+            assert [r["session_id"] for r in payload] == [a["session_id"], b["session_id"]]
+
+        # The archive itself can still be removed independently.
+        assert client.delete(f"/archives/{aid}").status_code == 204
+        assert not storage.archive_path(aid).exists()
+
+
+def test_archive_write_failure_leaves_no_downloadable_artifact(monkeypatch):
+    with TestClient(app) as client:
+        a = _completed_named(client, "a.bin", b"aaaa")
+        b = _completed_named(client, "b.bin", b"bbbb")
+        before_files = set(os.listdir(config.archives_dir()))
+        before_rows = _archive_rows()
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        # Sources are all valid (opened first); the failure hits the archive
+        # write itself. No temp file, published file or record may survive.
+        monkeypatch.setattr(storage.zipfile, "ZipFile", boom)
+        with pytest.raises(OSError):
+            storage.create_archive([a["session_id"], b["session_id"]])
+        monkeypatch.undo()
+
+        _no_archive_residue()
+        assert set(os.listdir(config.archives_dir())) == before_files
+        assert _archive_rows() == before_rows
+
+        # The sources were untouched: a retry succeeds.
+        body = _create_archive(client, [a["session_id"], b["session_id"]]).json()
+        assert client.get(f"/archives/{body['archive_id']}/content").status_code == 200
+
+
+def test_archive_startup_reconcile_heals_orphans():
+    with TestClient(app) as client:
+        keep = _completed_named(client, "keep.bin", b"keep-me")
+        keep_body = _create_archive(client, [keep["session_id"]]).json()
+        keep_aid = keep_body["archive_id"]
+
+        a = _completed_named(client, "a.bin", b"aaaa")
+        body = _create_archive(client, [a["session_id"]]).json()
+        aid = body["archive_id"]
+
+    # Simulate three crash shapes outside the app:
+    # 1. published file with no DB row; 2. DB row with no file;
+    # 3. leftover temp artifact from an interrupted build.
+    with db.connect() as conn:
+        conn.execute("DELETE FROM archives WHERE id = ?", (aid,))
+    orphan = storage.archive_path("orphan123456789012345678901234567890ab")
+    orphan.write_bytes(b"PK\x03\x04leftover")
+    tmp = config.archives_dir() / f"{aid}.zip.tmp-deadbeef"
+    tmp.write_bytes(b"partial")
+
+    storage.reconcile()
+
+    # The orphan file and temp artifact are gone, and the row-less/less
+    # artifacts are healed...
+    assert not orphan.exists()
+    assert not tmp.exists()
+    assert not storage.archive_path(aid).exists()
+    with db.connect() as conn:
+        assert db.get_archive(conn, aid) is None
+        # ...while a perfectly valid (row + file) pair is preserved.
+        assert db.get_archive(conn, keep_aid) is not None
+    assert storage.archive_path(keep_aid).is_file()
+
+    # A second pass is a no-op and the good archive is still downloadable.
+    storage.reconcile()
+    with TestClient(app) as client:
+        resp = client.get(f"/archives/{keep_aid}/content")
+        assert resp.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            assert zf.read("keep.bin") == b"keep-me"
+
+
+def test_archive_streams_large_files_with_bounded_buffer():
+    # Multi-MiB sources force several 1 MiB copy blocks and span multiple
+    # upload chunks; the archive must still be byte-exact.
+    big1 = os.urandom(5 * 1024 * 1024 // 2)
+    tile = bytes((i * 7 + 3) % 256 for i in range(4096))
+    target = 2 * 1024 * 1024 + 17
+    big2 = (tile * (target // len(tile) + 1))[:target]
+    with TestClient(app) as client:
+        one = _completed_named(client, "big1.raw", big1)
+        two = _completed_named(client, "big2.raw", big2)
+        body = _create_archive(client, [two["session_id"], one["session_id"]]).json()
+        assert body["files"][0]["size"] == len(big2)
+        assert body["files"][1]["size"] == len(big1)
+
+        resp = client.get(f"/archives/{body['archive_id']}/content")
+        assert resp.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+            assert zf.namelist() == ["big2.raw", "big1.raw"]
+            assert zf.read("big1.raw") == big1
+            assert zf.read("big2.raw") == big2

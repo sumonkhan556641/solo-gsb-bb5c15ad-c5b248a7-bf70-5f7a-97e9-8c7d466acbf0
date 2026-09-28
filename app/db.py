@@ -42,6 +42,22 @@ CREATE TABLE IF NOT EXISTS chunks (
     received_at TEXT NOT NULL,
     PRIMARY KEY (session_id, chunk_index)
 );
+
+CREATE TABLE IF NOT EXISTS archives (
+    id          TEXT PRIMARY KEY,
+    path        TEXT NOT NULL,
+    size        INTEGER NOT NULL,
+    created_at  TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS archive_entries (
+    archive_id     TEXT NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,   -- order in the request / ZIP
+    session_id      TEXT NOT NULL,      -- source row may be deleted independently
+    entry_name      TEXT NOT NULL,      -- unique, collision-free name inside the ZIP
+    file_size       INTEGER NOT NULL,
+    PRIMARY KEY (archive_id, position)
+);
 """
 
 # Columns added when the session-lease feature was introduced; databases
@@ -193,3 +209,20 @@ def session_payload(
         payload["missing_chunks"] = []
         payload["received_count"] = 0
     return payload
+
+
+# ---------------------------------------------------------------- archives
+
+
+def get_archive(conn: sqlite3.Connection, archive_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM archives WHERE id = ?", (archive_id,)
+    ).fetchone()
+
+
+def get_archive_entries(conn: sqlite3.Connection, archive_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT position, session_id, entry_name, file_size "
+        "FROM archive_entries WHERE archive_id = ? ORDER BY position",
+        (archive_id,),
+    ).fetchall()

@@ -11,6 +11,7 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "./data")).resolve()
 # Subdirectory layout inside DATA_DIR.
 SESSIONS_DIRNAME = "sessions"  # one subdir per upload session, holds .part chunks
 FILES_DIRNAME = "files"        # merged, completed files
+ARCHIVES_DIRNAME = "archives"  # batch ZIP exports of completed files
 DB_FILENAME = "uploads.db"
 
 # Port the container/uvicorn listens on (documentational; uvicorn flag wins).
@@ -42,7 +43,12 @@ def files_dir() -> Path:
     return DATA_DIR / FILES_DIRNAME
 
 
+def archives_dir() -> Path:
+    return DATA_DIR / ARCHIVES_DIRNAME
+
+
 def ensure_dirs() -> None:
     """Create the storage layout. Called at startup; safe to call repeatedly."""
     sessions_dir().mkdir(parents=True, exist_ok=True)
     files_dir().mkdir(parents=True, exist_ok=True)
+    archives_dir().mkdir(parents=True, exist_ok=True)
