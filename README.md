@@ -6,6 +6,7 @@
 - 分片**乱序上传、失败重试**均可，重复上传幂等
 - 全部分片校验通过后才**原子合并**（临时文件 + `rename`）为目标文件
 - 完成的文件可直接 **GET 下载**：支持完整下载与单段 `Range`（断点续传），携带以整文件 SHA-256 生成的强 **ETag**
+- 已完成会话支持**批量 ZIP 导出**：按请求顺序打包为单个 ZIP，重名文件自动生成稳定且不冲突的条目名；导出后删除原会话不影响既有归档
 - 查询接口实时返回**缺失分片列表**与会话状态
 - **上传会话租约**：可指定 `idle_timeout_seconds`（默认 86400 秒 / 1 天，上限 604800 秒 / 7 天）；后台定时任务与启动恢复扫描自动回收超时会话（标记 `expired`、删除分片、记录 `expired_at`）
 - 元数据存 SQLite、分片存磁盘，**服务重启后可继续未完成会话**
@@ -16,8 +17,10 @@
 ### Docker Compose（推荐）
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
+
+一条命令完成镜像构建、后台启动与 8000 端口映射；停止用 `docker compose down`。
 
 ### 本地运行
 
@@ -40,9 +43,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```
 data/
-├── uploads.db          # SQLite：会话与分片元数据（WAL 模式）
+├── uploads.db          # SQLite：会话、分片与归档元数据（WAL 模式）
 ├── sessions/<id>/chunks/NNNNNNNN.part   # 已接收分片
-└── files/<id>_<filename>                # 合并完成的文件
+├── files/<id>_<filename>                # 合并完成的文件
+└── archives/<archive_id>.zip            # 批量导出的 ZIP 归档
 ```
 
 ## API 一览
@@ -56,6 +60,9 @@ data/
 | GET    | `/uploads/{id}/content`               | 下载成品文件（支持 Range）                    |
 | GET    | `/uploads`                            | 列出可续传 / 已完成的会话（不含已过期）       |
 | DELETE | `/uploads/{id}`                       | 中止会话并清理                                |
+| POST   | `/archives`                           | 批量导出已完成会话为单个 ZIP                  |
+| GET    | `/archives/{id}/content`              | 下载归档 ZIP                                  |
+| DELETE | `/archives/{id}`                      | 删除归档 ZIP 及其记录                         |
 | GET    | `/healthz`                            | 健康检查                                      |
 
 ### 1. 创建会话
@@ -224,6 +231,52 @@ Content-Range: bytes */3000000
 
 下载时按区间在磁盘上**分块流式读取**（1 MiB 缓冲），不会把整个文件载入内存。
 
+### 6. 批量导出 ZIP 归档
+
+把多个**已完成**会话的成品文件按请求顺序打包到单个 ZIP。请求体为有序且不重复的 `session_id` 列表：
+
+```bash
+curl -X POST http://localhost:8000/archives \
+  -H 'Content-Type: application/json' \
+  -d '{"session_ids": ["<sid-1>", "<sid-2>", "<sid-3>"]}'
+```
+
+校验规则：
+
+- 列表必须非空、元素不重复（重复返回 `422`，错误体指明重复的 id）
+- 仅允许 `completed` 且成品文件仍在磁盘上的会话：未知会话 / 成品文件缺失返回 `404`，未完成（含 `uploading`、`expired`）返回 `409`
+- 任何一个会话不满足条件，整个请求失败（首个不合法条目的 id 随响应返回），**不会产生任何归档**
+
+ZIP 内条目顺序与请求一致；多个会话同名时自动生成稳定且不冲突的条目名并保留扩展名（首次出现用原名，其后依次为 `name_1.ext`、`name_2.ext`）。响应（`201`）返回归档 ID、ZIP 大小与文件列表：
+
+```json
+{
+  "archive_id": "2ea9c8ba5dba4fb8880811f1d5d01348",
+  "size": 245,
+  "created_at": "2026-09-28T21:29:13.992+00:00",
+  "files": [
+    {"position": 0, "session_id": "96241bab…", "source_filename": "dup.txt",
+     "entry_name": "dup.txt",   "size": 19},
+    {"position": 1, "session_id": "549f2a31…", "source_filename": "dup.txt",
+     "entry_name": "dup_1.txt", "size": 18}
+  ]
+}
+```
+
+构建过程保证不留下半成品：先把**全部源文件打开并固定**（即使归档创建后原会话被删除，打开的句柄仍能读全数据），再以 1 MiB 有界缓冲写入临时归档；写入成功后通过 `rename` **原子发布**，最后才在数据库记录归档 ID、文件列表与大小。任一步失败都会删除临时/已发布文件并回滚记录。
+
+下载与删除：
+
+```bash
+# 下载（200，Content-Type: application/zip）
+curl -o export.zip http://localhost:8000/archives/$AID/content
+
+# 删除归档 ZIP 与其记录（204）
+curl -X DELETE http://localhost:8000/archives/$AID
+```
+
+归档是**独立快照**：创建成功后再 `DELETE /uploads/{id}` 删除原上传会话（连同其成品文件），既有归档仍可正常下载；归档条目中会保留来源会话 id 与原始文件名。归档不存在时下载 / 删除均返回 `404`。
+
 ## 断点续传语义
 
 - 所有状态都在 `DATA_DIR` 内（SQLite + 分片文件），进程重启、容器重建（挂载同一 volume）后，未完成会话自动可用
@@ -239,7 +292,7 @@ pip install -r requirements-dev.txt
 pytest tests/
 ```
 
-测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理，以及会话租约默认值/上限校验、创建后立即查询状态返回 200 并续租（回归）、分片上传与状态查询续租、后台回收（标记过期、删分片、上传/complete 返回 410 带 `expired_at`、过期会话可读但不续租也不入列表）、合并中会话不被回收、已完成与已删除会话不被误改、启动恢复扫描和旧库迁移。
+测试覆盖：乱序上传、错误哈希拒绝与重试、重复分片幂等、未齐时合并返回 409、重启续传、整文件哈希校验、会话中止、完整/区间下载、ETag 与 304、If-Range 回退、416 越界处理，以及会话租约默认值/上限校验、创建后立即查询状态返回 200 并续租（回归）、分片上传与状态查询续租、后台回收（标记过期、删分片、上传/complete 返回 410 带 `expired_at`、过期会话可读但不续租也不入列表）、合并中会话不被回收、已完成与已删除会话不被误改、启动恢复扫描和旧库迁移；批量归档覆盖按请求顺序打包、重名稳定去重并保留扩展名、重复/空列表返回 422、未完成返回 409、未知会话或成品缺失返回 404、归档下载与删除、源会话删除后归档仍可下载、构建中途源会话被删除仍成功、写入失败不留临时文件与记录、启动清理残留临时/孤儿归档。
 
 ## 客户端示例（Python）
 
@@ -286,4 +339,15 @@ r = requests.get(
     headers={"Range": "bytes=1048576-", "If-Range": etag},
 )
 assert r.status_code in (200, 206)  # 206=区间有效；200=文件已变，给的是完整内容
+
+# 批量导出：把多个已完成会话按顺序打包为一个 ZIP
+ar = requests.post(f"{BASE}/archives", json={"session_ids": [sid, other_sid]})
+ar.raise_for_status()  # 404=会话/成品缺失, 409=会话未完成, 422=列表重复
+aid = ar.json()["archive_id"]
+with requests.get(f"{BASE}/archives/{aid}/content", stream=True) as r:
+    r.raise_for_status()
+    with open("export.zip", "wb") as out:
+        for block in r.iter_content(1024 * 1024):
+            out.write(block)
+# 归档独立于源会话：之后 requests.delete(f"{BASE}/uploads/{sid}") 也不影响 export.zip
 ```

@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
     config.ensure_dirs()
     db.init_db()
     storage.reconcile()
+    storage.reconcile_archives()
     # Recovery sweep: expire idle leases that elapsed while we were down.
     _reap_once()
     stop = threading.Event()
@@ -96,6 +97,24 @@ class CreateSessionRequest(BaseModel):
                 raise ValueError("file_sha256 must be 64 hex characters")
             return value.lower()
         return None
+
+
+class CreateArchiveRequest(BaseModel):
+    session_ids: list[str] = Field(
+        min_length=1,
+        max_length=1000,
+        description="Ordered, unique ids of completed sessions to bundle into one ZIP",
+    )
+
+    @field_validator("session_ids")
+    @classmethod
+    def _ordered_unique(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for sid in value:
+            if sid in seen:
+                raise ValueError(f"session_id {sid!r} appears more than once")
+            seen.add(sid)
+        return value
 
 
 # ---------------------------------------------------------------- helpers
@@ -490,3 +509,62 @@ def abort_session(session_id: str):
             os.unlink(session["final_path"])
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------- batch archives
+
+
+@app.post("/archives", status_code=status.HTTP_201_CREATED)
+def create_archive(body: CreateArchiveRequest) -> dict:
+    """Bundle several completed uploads into a single ZIP export.
+
+    The session ids must be a non-empty, ordered list with no duplicates; the
+    ZIP entries follow that order. Only completed sessions whose merged file
+    still exists may be included. Files are pinned open before writing,
+    streamed through bounded buffers to a temp archive, then atomically
+    published and recorded, so any invalid source or write failure leaves no
+    downloadable artifact.
+    """
+    try:
+        return storage.build_archive(body.session_ids)
+    except storage.ArchiveError as exc:
+        detail: object = {
+            "message": str(exc),
+            "session_id": exc.session_id,
+        }
+        raise HTTPException(exc.status_code, detail=detail)
+
+
+@app.get("/archives/{archive_id}/content")
+def download_archive(archive_id: str):
+    """Download a published batch ZIP (full download, streamed from disk)."""
+    with db.connect() as conn:
+        archive = db.get_archive(conn, archive_id)
+    if archive is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "archive not found")
+    path = storage.archive_path(archive_id)
+    if not path.is_file():
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "archive file is missing on disk"
+        )
+    headers = {
+        "Content-Length": str(path.stat().st_size),
+        "Content-Disposition": f'attachment; filename="{archive_id}.zip"',
+    }
+    return StreamingResponse(
+        storage.iter_file_range(path, 0, path.stat().st_size - 1),
+        status_code=status.HTTP_200_OK,
+        headers=headers,
+        media_type="application/zip",
+    )
+
+
+@app.delete("/archives/{archive_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_archive_endpoint(archive_id: str):
+    """Delete a batch ZIP export and its record.
+
+    No `-> None` return annotation: see `abort_session` for why a 204 endpoint
+    must not declare one on the oldest supported fastapi releases.
+    """
+    if not storage.delete_archive(archive_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "archive not found")

@@ -42,6 +42,28 @@ CREATE TABLE IF NOT EXISTS chunks (
     received_at TEXT NOT NULL,
     PRIMARY KEY (session_id, chunk_index)
 );
+
+-- Batch ZIP exports. An archive is a self-contained snapshot: source_session_id
+-- is deliberately NOT a foreign key, so deleting an upload session after the
+-- archive is created leaves the archive and its records fully intact.
+CREATE TABLE IF NOT EXISTS archives (
+    id         TEXT PRIMARY KEY,
+    size       INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS archive_entries (
+    archive_id      TEXT NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL,   -- 0-based order requested by the client
+    session_id      TEXT NOT NULL,      -- session this entry was taken from
+    source_filename TEXT NOT NULL,      -- filename the session was uploaded with
+    entry_name      TEXT NOT NULL,      -- unique name used inside the ZIP
+    size            INTEGER NOT NULL,
+    PRIMARY KEY (archive_id, position)
+);
+
+CREATE INDEX IF NOT EXISTS idx_archive_entries_archive
+    ON archive_entries (archive_id, position);
 """
 
 # Columns added when the session-lease feature was introduced; databases
@@ -160,6 +182,40 @@ def touch_session(conn: sqlite3.Connection, session_id: str, moment: str) -> Non
         "UPDATE sessions SET last_activity = ? WHERE id = ? AND status = 'uploading'",
         (moment, session_id),
     )
+
+
+def get_archive(conn: sqlite3.Connection, archive_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM archives WHERE id = ?", (archive_id,)
+    ).fetchone()
+
+
+def get_archive_entries(conn: sqlite3.Connection, archive_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM archive_entries WHERE archive_id = ? ORDER BY position",
+        (archive_id,),
+    ).fetchall()
+
+
+def archive_payload(
+    conn: sqlite3.Connection, archive: sqlite3.Row
+) -> dict:
+    """Public representation of an archive and its ordered file list."""
+    return {
+        "archive_id": archive["id"],
+        "size": archive["size"],
+        "created_at": archive["created_at"],
+        "files": [
+            {
+                "position": row["position"],
+                "session_id": row["session_id"],
+                "source_filename": row["source_filename"],
+                "entry_name": row["entry_name"],
+                "size": row["size"],
+            }
+            for row in get_archive_entries(conn, archive["id"])
+        ],
+    }
 
 
 def session_payload(

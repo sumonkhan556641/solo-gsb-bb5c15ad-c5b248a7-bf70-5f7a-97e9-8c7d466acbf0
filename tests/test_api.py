@@ -6,10 +6,15 @@ Run with:  DATA_DIR=$(mktemp -d) pytest tests/
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import sqlite3
 import tempfile
+import zipfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
 
 # Point storage at a throwaway directory BEFORE importing the app.
 _TMP = tempfile.mkdtemp(prefix="chunked-upload-test-")
@@ -545,6 +550,255 @@ def test_startup_recovery_sweep_expires_stale_sessions():
         assert _put(client, fresh_sid, 1, chunks[1]).status_code == 200
         done = client.post(f"/uploads/{fresh_sid}/complete")
         assert done.status_code == 200, done.text
+
+
+def _completed_named(
+    client: TestClient, name: str, data: bytes, chunk_size: int
+) -> dict:
+    """Like _completed but with a chosen upload filename."""
+    session = _create_named(client, name, data, chunk_size, file_sha256=_sha256(data))
+    sid = session["session_id"]
+    for index, offset in enumerate(range(0, len(data), chunk_size)):
+        assert _put(client, sid, index, data[offset : offset + chunk_size]).status_code == 200
+    done = client.post(f"/uploads/{sid}/complete")
+    assert done.status_code == 200, done.text
+    return done.json()
+
+
+def _create_named(
+    client: TestClient, name: str, data: bytes, chunk_size: int, **extra
+) -> dict:
+    resp = client.post(
+        "/uploads",
+        json={
+            "filename": name,
+            "total_size": len(data),
+            "chunk_size": chunk_size,
+            **extra,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def archive_count() -> int:
+    with db.connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM archives").fetchone()[0]
+
+
+# ----------------------------------------------------------------- archives
+
+
+def test_create_archive_orders_and_deduplicates_entries():
+    with TestClient(app) as client:
+        a = b"alpha-contents"
+        b = b"beta-contents-longer"
+        c = b"gamma"
+        done_a = _completed_named(client, "report.pdf", a, 256)
+        done_b = _completed_named(client, "report.pdf", b, 256)
+        done_c = _completed_named(client, "notes.txt", c, 256)
+
+        resp = client.post(
+            "/archives",
+            json={
+                "session_ids": [
+                    done_b["session_id"],  # first claim wins the base name
+                    done_a["session_id"],
+                    done_c["session_id"],
+                ]
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        body = resp.json()
+        aid = body["archive_id"]
+        assert [f["entry_name"] for f in body["files"]] == [
+            "report.pdf",
+            "report_1.pdf",
+            "notes.txt",
+        ]
+        assert [f["source_filename"] for f in body["files"]] == [
+            "report.pdf",
+            "report.pdf",
+            "notes.txt",
+        ]
+        assert [f["size"] for f in body["files"]] == [len(b), len(a), len(c)]
+        assert [f["position"] for f in body["files"]] == [0, 1, 2]
+        assert body["size"] > 0
+
+        # Download and verify the ZIP structure and payload order.
+        dl = client.get(f"/archives/{aid}/content")
+        assert dl.status_code == 200
+        assert dl.headers["content-type"] == "application/zip"
+        assert int(dl.headers["content-length"]) == body["size"]
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            assert zf.namelist() == ["report.pdf", "report_1.pdf", "notes.txt"]
+            assert zf.testzip() is None
+            assert zf.read("report.pdf") == b
+            assert zf.read("report_1.pdf") == a
+            assert zf.read("notes.txt") == c
+
+        # The published ZIP exists on disk under archives/.
+        assert storage.archive_path(aid).is_file()
+
+
+def test_archive_validation_errors():
+    with TestClient(app) as client:
+        data, chunks = _make_file(256, total_chunks=2, last_size=256)
+        done = _completed(client, data, 256)
+        sid = done["session_id"]
+        uploading = _create(client, data, 256)["session_id"]
+        archives_before = set(config.archives_dir().glob("*.zip"))
+        count_before = archive_count()
+
+        # Empty list and duplicate ids are rejected at the schema level.
+        assert client.post("/archives", json={"session_ids": []}).status_code == 422
+        dup = client.post("/archives", json={"session_ids": [sid, sid]})
+        assert dup.status_code == 422
+
+        # Unknown session -> 404 identifying the offending id.
+        missing = client.post("/archives", json={"session_ids": ["nope"]})
+        assert missing.status_code == 404
+        assert missing.json()["detail"]["session_id"] == "nope"
+
+        # Non-completed session -> 409.
+        busy = client.post("/archives", json={"session_ids": [uploading]})
+        assert busy.status_code == 409
+        assert busy.json()["detail"]["session_id"] == uploading
+
+        # A bad entry anywhere (even last) blocks the whole export.
+        mix = client.post(
+            "/archives", json={"session_ids": [sid, "nope"]}
+        )
+        assert mix.status_code == 404
+        assert mix.json()["detail"]["session_id"] == "nope"
+        # Nothing was published or recorded.
+        assert set(config.archives_dir().glob("*.zip")) == archives_before
+        assert archive_count() == count_before
+
+
+def test_archive_download_and_delete():
+    with TestClient(app) as client:
+        done = _completed_named(client, "f.dat", b"hello archive", 256)
+        aid = client.post(
+            "/archives", json={"session_ids": [done["session_id"]]}
+        ).json()["archive_id"]
+
+        assert client.get("/archives/unknown/content").status_code == 404
+        assert client.delete("/archives/unknown").status_code == 404
+
+        assert client.delete(f"/archives/{aid}").status_code == 204
+        # 404 afterwards, both as download and as record.
+        assert client.get(f"/archives/{aid}/content").status_code == 404
+        assert client.delete(f"/archives/{aid}").status_code == 404
+        assert not storage.archive_path(aid).exists()
+        with db.connect() as conn:
+            assert db.get_archive(conn, aid) is None
+            assert db.get_archive_entries(conn, aid) == []
+
+
+def test_archive_survives_source_session_deletion():
+    with TestClient(app) as client:
+        done = _completed_named(client, "keep.txt", b"snapshot bytes", 256)
+        sid = done["session_id"]
+        created = client.post("/archives", json={"session_ids": [sid]})
+        assert created.status_code == 201
+        aid = created.json()["archive_id"]
+
+        # Remove the upload session, its record and its merged file: the
+        # archive is an independent snapshot and must keep working.
+        assert client.delete(f"/uploads/{sid}").status_code == 204
+        assert not os.path.exists(done["final_path"])
+        dl = client.get(f"/archives/{aid}/content")
+        assert dl.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(dl.content)) as zf:
+            assert zf.read("keep.txt") == b"snapshot bytes"
+        # The entry record still names the originating session.
+        with db.connect() as conn:
+            entry = db.get_archive_entries(conn, aid)[0]
+            assert entry["session_id"] == sid
+            assert entry["source_filename"] == "keep.txt"
+
+
+def test_archive_includes_session_deleted_mid_build():
+    with TestClient(app) as client:
+        done = _completed_named(client, "race.bin", b"racing bytes", 256)
+        sid = done["session_id"]
+        path = Path(done["final_path"])
+
+        # Delete the source session (which unlinks the merged file) the moment
+        # build_archive pins the source open. An open file descriptor keeps the
+        # bytes readable, so the snapshot must still build successfully.
+        import builtins
+
+        original_open = builtins.open
+        seen_open = False
+
+        def opening(*args, **kwargs):
+            nonlocal seen_open
+            fh = original_open(*args, **kwargs)
+            mode = args[1] if len(args) > 1 else kwargs.get("mode", "r")
+            if (
+                not seen_open
+                and args
+                and Path(args[0]) == path
+                and isinstance(mode, str)
+                and "b" in mode
+            ):
+                seen_open = True
+                resp = client.delete(f"/uploads/{sid}")
+                assert resp.status_code == 204
+            return fh
+
+        builtins.open = opening
+        try:
+            payload = storage.build_archive([sid])
+        finally:
+            builtins.open = original_open
+        assert seen_open
+
+        with zipfile.ZipFile(storage.archive_path(payload["archive_id"])) as zf:
+            assert zf.read("race.bin") == b"racing bytes"
+
+
+def test_archive_write_failure_leaves_nothing(monkeypatch):
+    with TestClient(app) as client:
+        done = _completed_named(client, "boom.dat", b"payload", 256)
+        sid = done["session_id"]
+        before = set(config.archives_dir().glob("*"))
+        count_before = archive_count()
+
+        class FailingZip:
+            def __init__(self, *args, **kwargs):
+                raise OSError("simulated disk full")
+
+        monkeypatch.setattr(storage.zipfile, "ZipFile", FailingZip)
+        with pytest.raises(OSError):
+            storage.build_archive([sid])
+
+        # No temp file, no published ZIP, no DB record survive.
+        assert set(config.archives_dir().glob("*")) == before
+        assert archive_count() == count_before
+
+
+def test_reconcile_archives_removes_debris_on_startup():
+    # A temp file from a crashed build and an orphaned ZIP (no DB row) are
+    # swept at startup; a live archive's ZIP is left untouched.
+    with TestClient(app) as client:
+        done = _completed_named(client, "live.dat", b"live", 256)
+        aid = client.post(
+            "/archives", json={"session_ids": [done["session_id"]]}
+        ).json()["archive_id"]
+        root = config.archives_dir()
+        tmp = root / f".{aid}other.zip.tmp-abcd"
+        orphan = root / "deadbeef.zip"
+        tmp.write_bytes(b"partial")
+        orphan.write_bytes(b"orphan")
+
+    with TestClient(app) as client:  # reboot triggers the sweep
+        assert not tmp.exists()
+        assert not orphan.exists()
+        assert storage.archive_path(aid).is_file()
+        assert client.get(f"/archives/{aid}/content").status_code == 200
 
 
 def test_init_db_migrates_pre_lease_database():
